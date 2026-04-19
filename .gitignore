@@ -1,0 +1,41 @@
+cat > .gitignore << 'EOF'
+# K8s & Minikube state
+~/.kube/config
+~/.minikube/
+*.kube/
+minikube/
+kubeconfig
+
+# Ansible & Infra
+inventory.ini
+*.vault
+.ansible/
+*.retry
+*.log
+
+# Terraform (если появится)
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Secrets & Env
+*.key
+*.pem
+*.pfx
+.env
+.env.*
+!env.example
+
+# Docker & Build
+*.tar.gz
+*.qcow2
+*.img
+EOF

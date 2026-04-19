@@ -1,0 +1,3 @@
+proxmox_host      = "<ваш ip -адрес>"
+proxmox_api_token = "root@pam!openTofu=xxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+ssh_public_key    = "<ваш ssh-public-key"

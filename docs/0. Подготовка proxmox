@@ -1,0 +1,3 @@
+Подготовка proxmox 
+
+Скрипт ~/.scripts/initialServerSetup.sh настраивет репозитории, dns, ntp на proxmox

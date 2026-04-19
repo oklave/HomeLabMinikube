@@ -1,0 +1,296 @@
+---
+- name: Provision Minikube Lab Node (Proxmox + 8GB RAM optimized)
+  hosts: minikube-lab
+  become: yes
+  gather_facts: yes
+  vars:
+    # Пользователь, под которым будет работать minikube
+    lab_user: "{{ ansible_user | default('ubuntu') }}"
+    
+    # Ресурсы для Minikube (оставляем ~1 ГБ хосту Proxmox)
+    minikube_memory: 3072   # МБ
+    minikube_cpus: 2
+    minikube_disk: 20g
+    
+    # Версии (можно зафиксировать для воспроизводимости)
+    kubectl_version: "{{ lookup('url', 'https://dl.k8s.io/release/stable.txt', split_lines=False) }}"
+    
+    # Сеть: если используешь статический IP в cloud-init, можно добавить хост в /etc/hosts
+    lab_domain: "lab.local"
+
+  pre_tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      tags: [setup, packages]
+
+  tasks:
+    # ==================== БАЗОВАЯ ПОДГОТОВКА ====================
+    - name: Install system prerequisites
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - wget
+          - gnupg
+          - conntrack
+          - iproute2
+          - bash-completion
+          - software-properties-common
+          - git
+        state: present
+      tags: [setup, packages]
+
+    - name: Disable swap immediately
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+      tags: [k8s, swap]
+
+    - name: Disable swap permanently (comment in fstab)
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\s+swap\s+.*)$'
+        replace: '# \1'
+        backup: yes
+      notify: Reload systemd daemon
+      tags: [k8s, swap]
+
+    - name: Load required kernel modules for Kubernetes networking
+      ansible.builtin.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop: [br_netfilter, overlay, nf_conntrack]
+      tags: [k8s, networking]
+
+    - name: Persist kernel modules at boot
+      ansible.builtin.copy:
+        content: "{{ item }}\n"
+        dest: "/etc/modules-load.d/{{ item }}.conf"
+        mode: '0644'
+      loop: [br_netfilter, overlay, nf_conntrack]
+      tags: [k8s, networking]
+
+    - name: Configure sysctl for Kubernetes
+      ansible.builtin.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+      loop:
+        - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { name: 'net.ipv4.ip_forward', value: '1' }
+      tags: [k8s, networking]
+
+    # ==================== DOCKER ====================
+    - name: Install Docker from Ubuntu repo
+      ansible.builtin.apt:
+        name: docker.io
+        state: present
+      tags: [docker, runtime]
+
+    - name: Enable and start Docker service
+      ansible.builtin.systemd:
+        name: docker
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      tags: [docker, runtime]
+
+    - name: Add user to docker group
+      ansible.builtin.user:
+        name: "{{ lab_user }}"
+        groups: docker
+        append: yes
+      tags: [docker, permissions]
+
+    - name: Wait for Docker socket to be ready
+      ansible.builtin.wait_for:
+        path: /var/run/docker.sock
+        timeout: 30
+      tags: [docker, runtime]
+
+    # ==================== KUBECTL ====================
+    - name: Install kubectl
+      ansible.builtin.shell: |
+        curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/amd64/kubectl"
+        chmod +x /tmp/kubectl
+        mv /tmp/kubectl /usr/local/bin/kubectl
+      args:
+        creates: /usr/local/bin/kubectl
+      changed_when: false
+      tags: [k8s, kubectl]
+
+    # ==================== MINIKUBE ====================
+    - name: Install minikube
+      ansible.builtin.shell: |
+        curl -fsSL -o /tmp/minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+        install /tmp/minikube /usr/local/bin/minikube
+      args:
+        creates: /usr/local/bin/minikube
+      changed_when: false
+      tags: [k8s, minikube]
+
+    # ==================== USER ENVIRONMENT ====================
+    - name: Ensure user directories exist
+      ansible.builtin.file:
+        path: "/home/{{ lab_user }}/{{ item }}"
+        state: directory
+        owner: "{{ lab_user }}"
+        group: "{{ lab_user }}"
+        mode: '0755'
+      loop: [.kube, .minikube, .config/k9s]
+      tags: [user, env]
+
+    - name: Install k9s (terminal UI for Kubernetes)
+      ansible.builtin.shell: |
+        curl -fsSL -o /tmp/k9s.tar.gz "https://github.com/derailed/k9s/releases/latest/download/k9s_Linux_amd64.tar.gz"
+        tar -xzf /tmp/k9s.tar.gz -C /tmp k9s
+        install /tmp/k9s /usr/local/bin/k9s
+      args:
+        creates: /usr/local/bin/k9s
+      changed_when: false
+      tags: [user, tools, k9s]
+
+    - name: Setup bash completion for kubectl and minikube
+      ansible.builtin.blockinfile:
+        path: "/home/{{ lab_user }}/.bashrc"
+        owner: "{{ lab_user }}"
+        group: "{{ lab_user }}"
+        mode: '0644'
+        create: yes
+        block: |
+          # Kubernetes CLI completions
+          if command -v kubectl &> /dev/null; then
+            source <(kubectl completion bash)
+            alias k=kubectl
+            complete -o default -F __start_kubectl k
+          fi
+          if command -v minikube &> /dev/null; then
+            source <(minikube completion bash)
+          fi
+        marker: "# {mark} KUBECTL/MINIKUBE COMPLETION"
+      tags: [user, env, completion]
+
+    - name: Add helpful aliases to user bashrc
+      ansible.builtin.blockinfile:
+        path: "/home/{{ lab_user }}/.bashrc"
+        owner: "{{ lab_user }}"
+        group: "{{ lab_user }}"
+        mode: '0644'
+        create: yes
+        block: |
+          # Lab aliases
+          alias kgs='kubectl get pods -A'
+          alias kgsn='kubectl get pods -n'
+          alias kgsa='kubectl get svc -A'
+          alias kgd='kubectl get deploy -A'
+          alias klogs='kubectl logs -f'
+          alias kctx='kubectl config current-context'
+          alias minipause='minikube pause'
+          alias miniunpause='minikube unpause'
+        marker: "# {mark} LAB ALIASES"
+      tags: [user, env, aliases]
+
+    # ==================== MINIKUBE START (с login shell!) ====================
+    - name: Verify docker access (simple check)
+      ansible.builtin.command: docker info
+      become: no
+      become_user: "{{ lab_user }}"
+      args:
+        executable: /bin/bash -lc
+      register: docker_test
+      changed_when: false
+      retries: 3
+      delay: 3
+      tags: [k8s, minikube, verify]
+
+    - name: Start Minikube cluster (idempotent, login shell)
+      ansible.builtin.shell: |
+        bash -lc "minikube start \
+          --driver=docker \
+          --cpus={{ minikube_cpus }} \
+          --memory={{ minikube_memory }} \
+          --disk-size={{ minikube_disk }} \
+          --cni=calico \
+          --wait=all \
+          --embed-certs"
+      become: no
+      become_user: "{{ lab_user }}"
+      environment:
+        HOME: "/home/{{ lab_user }}"
+      register: mk_result
+      changed_when: >
+        'is already running' not in mk_result.stdout and
+        'Restarting existing' not in mk_result.stdout and
+        mk_result.rc == 0
+      when: docker_test.rc == 0
+      tags: [k8s, minikube, start]
+
+    # ==================== POST-INSTALL VERIFICATION ====================
+    - name: Wait for cluster to be fully ready
+      ansible.builtin.command: kubectl wait --for=condition=ready pod -l k8s-app=kube-dns -n kube-system --timeout=60s
+      become: no
+      become_user: "{{ lab_user }}"
+      args:
+        executable: /bin/bash -lc
+      register: cluster_ready
+      changed_when: false
+      retries: 2
+      delay: 10
+      when: mk_result.changed or mk_result.rc == 0
+      tags: [k8s, verify]
+
+    - name: Show cluster status (debug output)
+      ansible.builtin.debug:
+        msg: |
+          ✅ Minikube provisioned successfully!
+          
+          📊 Cluster info:
+          {{ mk_result.stdout | default('N/A') }}
+          
+          🔑 Connect via SSH:
+          ssh {{ lab_user }}@{{ ansible_host }}
+          
+          🎯 Quick start:
+          ssh {{ lab_user }}@{{ ansible_host }}
+          $ k9s                    # терминальный дашборд
+          $ k get nodes           # проверить ноды
+          $ minikube kubectl -- get pods -A  # системные поды
+      when: mk_result.rc == 0
+      tags: [info]
+
+  handlers:
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+  post_tasks:
+    - name: Final health check
+      ansible.builtin.command: minikube status --output=json
+      become: no
+      become_user: "{{ lab_user }}"
+      args:
+        executable: /bin/bash -lc
+      register: final_status
+      changed_when: false
+      ignore_errors: yes
+      tags: [verify, final]
+
+    - name: Display final status summary
+      ansible.builtin.debug:
+        msg: |
+          🏁 Provisioning complete!
+          
+          📦 Resources allocated:
+            • CPUs: {{ minikube_cpus }}
+            • RAM: {{ minikube_memory }} MB
+            • Disk: {{ minikube_disk }}
+          
+          ⚠️  Для экономии памяти на хосте (8 ГБ):
+            • Останови кластер, когда не учишься:  minikube pause
+            • Запусти снова:  minikube unpause
+            • Не включай heavy-аддоны (dashboard, metrics-server) без необходимости
+      tags: [info, final]
